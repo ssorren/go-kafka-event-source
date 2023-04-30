@@ -16,6 +16,7 @@
 package sak
 
 import (
+	"bytes"
 	"unsafe"
 )
 
@@ -181,4 +182,16 @@ func Must[T any](item T, err error) T {
 		panic(err)
 	}
 	return item
+}
+
+const intByteSize = int(unsafe.Sizeof(uintptr(1)))
+
+func WriteSignedIntToByteArray[T Signed](i T, b *bytes.Buffer) {
+	var arr [intByteSize]byte
+	*(*int64)(unsafe.Pointer(&arr[0])) = int64(i)
+	b.Write(arr[:])
+}
+
+func ReadIntegerFromByteArray[T Signed](b []byte) T {
+	return T(*(*int64)(unsafe.Pointer(&b[0])))
 }

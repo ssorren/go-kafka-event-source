@@ -37,7 +37,6 @@ type eventSourceConsumer[T StateStore] struct {
 	incrBalancer       IncrementalGroupRebalancer
 	eventSource        *EventSource[T]
 	source             *Source
-	commitLog          *eosCommitLog
 	producerPool       *eosProducerPool[T]
 	metrics            chan Metric
 	// prepping           map[int32]*partitionPrepper[T]
@@ -46,7 +45,6 @@ type eventSourceConsumer[T StateStore] struct {
 // Creates a new eventSourceConsumer.
 // `eventSource` must be a fully initialized EventSource.
 func newEventSourceConsumer[T StateStore](eventSource *EventSource[T], additionalClientOptions ...kgo.Opt) (*eventSourceConsumer[T], error) {
-	cl := newEosCommitLog(eventSource.ForkRunStatus(), eventSource.source, int(commitLogPartitionsConfig(eventSource.source)))
 	var partitionedStore *partitionedChangeLog[T]
 	source := eventSource.source
 	partitionedStore = newPartitionedChangeLog(eventSource.createChangeLogReceiver, source.StateStoreTopicName())
@@ -58,7 +56,6 @@ func newEventSourceConsumer[T StateStore](eventSource *EventSource[T], additiona
 		prepping:         make(map[int32]*stateStorePartition[T]),
 		eventSource:      eventSource,
 		source:           source,
-		commitLog:        cl,
 		metrics:          eventSource.metrics,
 	}
 	balanceStrategies := source.config.BalanceStrategies
@@ -76,7 +73,7 @@ func newEventSourceConsumer[T StateStore](eventSource *EventSource[T], additiona
 		kgo.OnPartitionsRevoked(sc.partitionsRevoked),
 		kgo.SessionTimeout(6 * time.Second),
 		kgo.FetchMaxWait(time.Second),
-		kgo.AdjustFetchOffsetsFn(sc.adjustOffsetsBeforeAssign)}
+	}
 
 	if len(additionalClientOptions) > 0 {
 		opts = append(opts, additionalClientOptions...)
@@ -98,7 +95,7 @@ func newEventSourceConsumer[T StateStore](eventSource *EventSource[T], additiona
 	}
 
 	eosConfig.validate()
-	sc.producerPool = newEOSProducerPool[T](source, cl, eosConfig, client, eventSource.metrics)
+	sc.producerPool = newEOSProducerPool[T](source, eosConfig, client, eventSource.metrics)
 
 	for _, gb := range groupBalancers {
 		if igr, ok := gb.(IncrementalGroupRebalancer); ok {
@@ -112,22 +109,6 @@ func newEventSourceConsumer[T StateStore](eventSource *EventSource[T], additiona
 		return nil, err
 	}
 	return sc, nil
-}
-
-// Since we're using out own commit log, adjust the starting offset for a newly assigned partition to refelct what is in the commitLog.
-func (sc *eventSourceConsumer[T]) adjustOffsetsBeforeAssign(ctx context.Context, assignments map[string]map[int32]kgo.Offset) (map[string]map[int32]kgo.Offset, error) {
-	for topic, partitionAssignments := range assignments {
-		partitions := sak.MapKeysToSlice(partitionAssignments)
-		for _, p := range partitions {
-			tp := ntp(p, topic)
-			offset := sc.commitLog.Watermark(tp)
-			log.Infof("starting consumption for %+v at offset: %d", tp, offset+1)
-			if offset > 0 {
-				partitionAssignments[p] = kgo.NewOffset().At(offset)
-			}
-		}
-	}
-	return assignments, nil
 }
 
 func (sc *eventSourceConsumer[T]) Client() *kgo.Client {
@@ -203,17 +184,11 @@ func (sc *eventSourceConsumer[T]) assignPartitions(topic string, partitions []in
 		if prepper, ok := sc.prepping[p]; ok {
 			log.Infof("syncing prepped partition %+v", prepper.topicPartition)
 			delete(sc.prepping, p)
-			sc.workers[p] = newPartitionWorker(sc.eventSource, tp, sc.commitLog, store, sc.producerPool, func() {
-				prepper.sync()
-				// sc.client.ResumeFetchPartitions(map[string][]int32{topic: {p}})
-			})
+			sc.workers[p] = newPartitionWorker(sc.eventSource, tp, store, sc.producerPool, prepper.sync)
 		} else if _, ok := sc.workers[p]; !ok {
 			prepper = sc.stateStoreConsumer.activatePartition(p, store)
 			log.Infof("syncing unprepped partition %+v", prepper.topicPartition)
-			sc.workers[p] = newPartitionWorker(sc.eventSource, tp, sc.commitLog, store, sc.producerPool, func() {
-				prepper.sync()
-				// sc.client.ResumeFetchPartitions(map[string][]int32{topic: {p}})
-			})
+			sc.workers[p] = newPartitionWorker(sc.eventSource, tp, store, sc.producerPool, prepper.sync)
 		}
 
 	}
@@ -268,8 +243,6 @@ func (sc *eventSourceConsumer[T]) receive(p kgo.FetchTopicPartition) {
 // Starts the underlying kafka client and syncs the local commit log for the consumer group.
 // Once synced, polls for records and forwards them to partitionWorkers.
 func (sc *eventSourceConsumer[T]) start() {
-	go sc.commitLog.Start()
-	sc.commitLog.syncAll()
 	for {
 		ctx, f := pollConsumer(sc.client)
 		if f.IsClientClosed() {

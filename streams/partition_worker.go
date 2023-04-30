@@ -81,7 +81,6 @@ type partitionWorker[T StateStore] struct {
 func newPartitionWorker[T StateStore](
 	eventSource *EventSource[T],
 	topicPartition TopicPartition,
-	commitLog *eosCommitLog,
 	changeLog changeLogPartition[T],
 	eosProducer *eosProducerPool[T],
 	waiter func()) *partitionWorker[T] {
@@ -110,7 +109,7 @@ func newPartitionWorker[T StateStore](
 		highestOffset:          -1,
 	}
 
-	go pw.work(pw.eventSource.interjections, waiter, commitLog)
+	go pw.work(pw.eventSource.interjections, waiter)
 
 	return pw
 }
@@ -203,24 +202,21 @@ func (pw *partitionWorker[T]) scheduleInterjection(inter *interjection[T]) {
 	pw.interjectionEventInput <- ec
 }
 
-func (pw *partitionWorker[T]) work(interjections []interjection[T], waiter func(), commitLog *eosCommitLog) {
+func (pw *partitionWorker[T]) work(interjections []interjection[T], waiter func()) {
 	elapsed := sincer{time.Now()}
 	// the partition is not ready to receive events as it is still bootstrapping the state store.
 	// in the case where this partition was assigned due to a failure on another consumer, this could be a lengthy process
 	// if we continue to consume events for this partition, we will fill it's input buffer
 	// and block other partitions on this consumer. pause the partition until tghe state store is bootstrapped
-	pw.eventSource.consumer.Client().PauseFetchPartitions(map[string][]int32{
+	partitionMap := map[string][]int32{
 		pw.topicPartition.Topic: {pw.topicPartition.Partition},
-	})
-	// don't start consuming until this function returns
-	// this function will block until all changelogs for this partition are populated
-	pw.highestOffset = commitLog.lastProcessed(pw.topicPartition)
-	log.Debugf("partitionWorker initialized %+v with lastProcessed offset: %d in %v", pw.topicPartition, pw.highestOffset, elapsed)
+	}
+	pw.eventSource.consumer.Client().PauseFetchPartitions(partitionMap)
+
 	waiter()
-	pw.eventSource.consumer.Client().ResumeFetchPartitions(map[string][]int32{
-		pw.topicPartition.Topic: {pw.topicPartition.Partition},
-	})
-	// resume partition if it was paused
+	// resume partition consumption
+	pw.eventSource.consumer.Client().ResumeFetchPartitions(partitionMap)
+
 	go pw.pushRecords()
 	atomic.StoreInt64(&pw.ready, 1)
 	log.Debugf("partitionWorker activated %+v in %v, interjectionCount: %d", pw.topicPartition, elapsed, len(interjections))

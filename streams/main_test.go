@@ -44,7 +44,6 @@ func TestMain(m *testing.M) {
 	if err := exec.Command("sh", kafkaCleanupScript).Run(); err != nil {
 		fmt.Println(err)
 	}
-
 	// download binaly distribution of kafka if necessary
 	if err := exec.Command("sh", kafkaDownloadScript, kafkaWorkingDir).Run(); err != nil {
 		fmt.Println(err)
@@ -77,6 +76,7 @@ func TestMain(m *testing.M) {
 	if err := exec.Command("sh", kafkaCleanupScript).Run(); err != nil {
 		fmt.Println(err)
 	}
+
 	os.Exit(code)
 }
 

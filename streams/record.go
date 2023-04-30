@@ -139,10 +139,6 @@ func (r IncomingRecord) HeaderValue(name string) []byte {
 	return nil
 }
 
-func (r IncomingRecord) isMarkerRecord() bool {
-	return isMarkerRecord(&r.kRecord)
-}
-
 func (r *Record) Offset() int64 {
 	return r.kRecord.Offset
 }

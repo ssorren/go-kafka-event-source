@@ -407,11 +407,12 @@ func (ir *incrementalRebalancer) ParseSyncAssignment(assignment []byte) (map[str
 		wg := &sync.WaitGroup{}
 		wg.Add(len(instructions.Forget))
 		for _, tp := range instructions.Forget {
+			tp2 := tp
 			prepping := ir.preparing.Remove(tp)
 			prepped := ir.ready.Remove(tp)
 			if prepping || prepped {
 				go func() {
-					ir.instructionHandler.ForgetPreparedTopicPartition(tp)
+					ir.instructionHandler.ForgetPreparedTopicPartition(tp2)
 					wg.Done()
 				}()
 			} else {

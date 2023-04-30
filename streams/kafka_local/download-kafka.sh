@@ -1,5 +1,5 @@
 KAFKA_BIN_VERSION="2.13"
-KAFKA_VERSION="3.2.1"
+KAFKA_VERSION="3.2.3"
 
 echo "kafka install: ${KAFKA_INSTALL}"
 if [ -z $KAFKA_INSTALL ]

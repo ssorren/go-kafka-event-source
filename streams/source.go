@@ -54,8 +54,6 @@ type EventSourceConfig struct {
 	ReplicationFactor int
 	// The desired min-insync-replicas for Topic. Defaults to 1.
 	MinInSync int
-	// The number of Kafka partitions to use for the applications commit log. Defaults to 5 if unset.
-	CommitLogPartitions int
 	// The Kafka cluster on which Topic resides, or the source of incoming events.
 	SourceCluster Cluster
 	// StateCluster is the Kafka cluster on which the commit log and the StateStore topic resides. If left unset (recommended), defaults to SourceCluster.
@@ -137,7 +135,8 @@ func (s *Source) onPartitionsRevoked(partitions []int32) {
 }
 
 func (s *Source) shouldMarkCommit() bool {
-	return s.config.CommitOffsets
+	return false
+	// return s.config.CommitOffsets
 }
 
 func (s *Source) eosErrorHandler() TxnErrorHandler {
@@ -230,9 +229,9 @@ func replicationFactorConfig(source *Source) int {
 	return source.config.ReplicationFactor
 }
 
-func commitLogPartitionsConfig(source *Source) int {
-	if source.config.CommitLogPartitions <= 0 {
-		return 5
-	}
-	return source.config.CommitLogPartitions
-}
+// func commitLogPartitionsConfig(source *Source) int {
+// 	if source.config.CommitLogPartitions <= 0 {
+// 		return 5
+// 	}
+// 	return source.config.CommitLogPartitions
+// }

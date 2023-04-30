@@ -23,7 +23,9 @@ import (
 
 	"github.com/aws/go-kafka-event-source/streams/sak"
 	"github.com/google/uuid"
+	"github.com/twmb/franz-go/pkg/kerr"
 	"github.com/twmb/franz-go/pkg/kgo"
+	"github.com/twmb/franz-go/pkg/kmsg"
 )
 
 const (
@@ -94,7 +96,7 @@ type eosProducerPool[T StateStore] struct {
 	commitClient      *kgo.Client
 }
 
-func newEOSProducerPool[T StateStore](source *Source, commitLog *eosCommitLog, cfg EosConfig, commitClient *kgo.Client, metrics chan Metric) *eosProducerPool[T] {
+func newEOSProducerPool[T StateStore](source *Source, cfg EosConfig, commitClient *kgo.Client, metrics chan Metric) *eosProducerPool[T] {
 	pp := &eosProducerPool[T]{
 		cfg:               cfg,
 		producerNodeQueue: make(chan *producerNode[T], cfg.PoolSize),
@@ -114,7 +116,7 @@ func newEOSProducerPool[T StateStore](source *Source, commitLog *eosCommitLog, c
 	var prev *producerNode[T]
 	var last *producerNode[T]
 	for i := 0; i < cfg.PoolSize; i++ {
-		p := newProducerNode(i, source, commitLog, pp.partitionOwners, commitClient, metrics, pp.errorChannel)
+		p := newProducerNode(i, source, pp.partitionOwners, commitClient, metrics, pp.errorChannel)
 		pp.producerNodes = append(pp.producerNodes, p)
 		if first == nil {
 			first = p
@@ -248,7 +250,6 @@ type producerNode[T any] struct {
 	commitClient      *kgo.Client
 	txnContext        context.Context
 	txnContextCancel  func()
-	commitLog         *eosCommitLog
 	next              *producerNode[T]
 	metrics           chan Metric
 	source            *Source
@@ -266,14 +267,17 @@ type producerNode[T any] struct {
 	id                int
 	txnErrorHandler   TxnErrorHandler
 	errorChannel      chan error
+	groupId           string
+	txnId             string
 	// errs                  []error
 }
 
-func newProducerNode[T StateStore](id int, source *Source, commitLog *eosCommitLog, partitionOwners partitionOwners[T], commitClient *kgo.Client, metrics chan Metric, errorChannel chan error) *producerNode[T] {
+func newProducerNode[T StateStore](id int, source *Source, partitionOwners partitionOwners[T], commitClient *kgo.Client, metrics chan Metric, errorChannel chan error) *producerNode[T] {
+	txnId := uuid.NewString()
 	client := sak.Must(NewClient(
 		source.stateCluster(),
 		kgo.RecordPartitioner(NewOptionalPartitioner(kgo.StickyKeyPartitioner(nil))),
-		kgo.TransactionalID(uuid.NewString()),
+		kgo.TransactionalID(txnId),
 		kgo.TransactionTimeout(30*time.Second),
 	))
 
@@ -284,12 +288,13 @@ func newProducerNode[T StateStore](id int, source *Source, commitLog *eosCommitL
 		source:            source,
 		errorChannel:      errorChannel,
 		id:                id,
-		commitLog:         commitLog,
 		shouldMarkCommit:  source.shouldMarkCommit(),
 		currentPartitions: make(map[int32]eventContextDll[T]),
 		partitionOwners:   partitionOwners,
 		txnErrorHandler:   source.eosErrorHandler(),
 		recordsToProduce:  pendingRecordPool.Borrow(),
+		txnId:             txnId,
+		groupId:           source.config.GroupId,
 	}
 }
 
@@ -333,27 +338,76 @@ func (p *producerNode[T]) beginTransaction() {
 	}
 }
 
-func (p *producerNode[T]) finalizeEventContexts(first, last *EventContext[T]) error {
+func (p *producerNode[T]) addOffsetsToTxn() error {
+	var reqErr error
+	req := kmsg.NewAddOffsetsToTxnRequest()
+	req.Group = p.groupId
+	req.TransactionalID = p.txnId
+	req.ProducerID, req.ProducerEpoch, reqErr = p.client.ProducerID(p.txnContext)
+	if reqErr != nil {
+		return reqErr
+	}
+
+	resp, err := req.RequestWith(context.Background(), p.client)
+	if err != nil {
+		return err
+	}
+	return kerr.ErrorForCode(resp.ErrorCode)
+}
+
+func (p *producerNode[T]) commitOffsets(topics ...kmsg.TxnOffsetCommitRequestTopic) error {
+	var reqErr error
+	req := kmsg.NewTxnOffsetCommitRequest()
+	req.Group = p.groupId
+	req.MemberID, req.Generation = p.commitClient.GroupMetadata()
+	req.ProducerID, req.ProducerEpoch, reqErr = p.client.ProducerID(p.txnContext)
+	if reqErr != nil {
+		return reqErr
+	}
+	req.Topics = topics
+
+	resp, err := req.RequestWith(p.txnContext, p.client)
+	if err != nil {
+		return err
+	}
+
+	for _, t := range resp.Topics {
+		for _, p := range t.Partitions {
+			if err := kerr.ErrorForCode(p.ErrorCode); err != nil {
+				return err
+			}
+		}
+	}
+	return nil
+}
+
+func (p *producerNode[T]) finalizeEventContexts(first, last *EventContext[T], offsets []kmsg.TxnOffsetCommitRequestTopicPartition) ([]kmsg.TxnOffsetCommitRequestTopicPartition, error) {
+
 	commitRecordProduced := false
 	// we'll now iterate in reverse order - committing the largest offset
 	for ec := last; ec != nil; ec = ec.prev {
 		select {
 		case <-ec.done:
 		case <-p.txnContext.Done():
-			return fmt.Errorf("txn timeout exceeded. waiting for event context to finish: %+v", ec)
+			return nil, fmt.Errorf("txn timeout exceeded. waiting for event context to finish: %+v", ec)
 		}
 		offset := ec.Offset()
+
 		// if less than 0, this is an interjection, no record to commit
 		if !commitRecordProduced && offset >= 0 {
-			// we only want to produce the highest offset, since these are in reverse order
-			// produce a commit record for the first real offset we see
+			reqPartition := kmsg.NewTxnOffsetCommitRequestTopicPartition()
+			reqPartition.Partition = ec.partition()
+			reqPartition.Offset = ec.Offset() + 1
+			reqPartition.LeaderEpoch = ec.input.LeaderEpoch()
+			memberId, _ := p.commitClient.GroupMetadata()
+			reqPartition.Metadata = &memberId
+
+			offsets = append(offsets, reqPartition)
 			commitRecordProduced = true
-			crd := p.commitLog.commitRecord(ec.TopicPartition(), offset)
-			p.ProduceRecord(ec, crd, nil)
 		}
 		ec.revocationWaiter.Done()
 	}
-	return nil
+	return offsets, nil
 }
 
 func (p *producerNode[T]) commit() error {
@@ -367,17 +421,36 @@ func (p *producerNode[T]) commit() error {
 		p.partitionOwners.set(tp, p)
 	}
 	p.produceLock.Unlock()
+	offsets := make([]kmsg.TxnOffsetCommitRequestTopicPartition, 0, len(p.currentPartitions))
+	var err error
 	for _, dll := range p.currentPartitions {
-		if err := p.finalizeEventContexts(dll.root, dll.tail); err != nil {
+		if offsets, err = p.finalizeEventContexts(dll.root, dll.tail, offsets); err != nil {
 			log.Errorf("eos finalization error: %v", err)
 			return err
 		}
 	}
-	err := p.client.Flush(p.txnContext)
+
+	err = p.client.Flush(p.txnContext)
 	if err != nil {
 		log.Errorf("eos producer error: %v", err)
 		return err
 	}
+
+	if len(offsets) > 0 {
+		if err := p.addOffsetsToTxn(); err != nil {
+			log.Errorf("eos add offsets error: %v", err)
+			return err
+		}
+		req := kmsg.NewTxnOffsetCommitRequestTopic()
+		req.Partitions = offsets
+		req.Topic = p.source.Topic()
+		err = p.commitOffsets(req)
+		if err != nil {
+			log.Errorf("eos commit error: %v", err)
+			return err
+		}
+	}
+
 	action := kgo.TryCommit
 	if p.produceCnt == 0 {
 		action = kgo.TryAbort

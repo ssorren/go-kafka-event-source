@@ -71,12 +71,12 @@ func EncodeJsonChangeLogEntryValue[T any](entryType string, item T) ChangeLogEnt
 type intCodec[T sak.Signed] struct{}
 
 func (intCodec[T]) Encode(b *bytes.Buffer, i T) error {
-	writeSignedIntToByteArray(i, b)
+	sak.WriteSignedIntToByteArray(i, b)
 	return nil
 }
 
 func (intCodec[T]) Decode(b []byte) (T, error) {
-	return readIntegerFromByteArray[T](b), nil
+	return sak.ReadIntegerFromByteArray[T](b), nil
 }
 
 // Convenience codec for working with int types.

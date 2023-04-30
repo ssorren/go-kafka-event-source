@@ -228,9 +228,12 @@ func CreateSource(sourceConfig EventSourceConfig) (resolved *Source, err error) 
 
 func resolveOrCreateTopics(source *Source, sourceTopicAdminClient, eosAdminClient *kadm.Client) (*Source, error) {
 	topic := source.Topic()
-	commitLogName := source.CommitLogTopicNameForGroupId()
 	changLogName := source.StateStoreTopicName()
-	res, err := sourceTopicAdminClient.ListTopicsWithInternal(context.Background(), topic)
+	topics := []string{topic}
+	if len(changLogName) > 0 {
+		topics = append(topics, changLogName)
+	}
+	res, err := sourceTopicAdminClient.ListTopicsWithInternal(context.Background(), topics...)
 	if err != nil {
 		return nil, err
 	}
@@ -245,24 +248,6 @@ func resolveOrCreateTopics(source *Source, sourceTopicAdminClient, eosAdminClien
 		}
 	}
 
-	topics := []string{commitLogName}
-	if len(changLogName) > 0 {
-		topics = append(topics, changLogName)
-	}
-	res, err = eosAdminClient.ListTopicsWithInternal(context.Background(), topics...)
-	if err != nil {
-		return nil, err
-	}
-	if val, ok := res[commitLogName]; ok && val.Err == nil {
-		source.config.CommitLogPartitions = len(val.Partitions.Numbers())
-	} else {
-		err = createTopic(eosAdminClient, commitLogPartitionsConfig(source),
-			replicationFactorConfig(source), minInSyncConfig(source), CompactCleanupPolicy, 0.9, commitLogName)
-		if err != nil {
-			return nil, err
-		}
-	}
-
 	if len(changLogName) > 0 {
 		if val, ok := res[changLogName]; ok && val.Err == nil {
 			changeLogPartitionCount := len(val.Partitions.Numbers())
@@ -271,7 +256,7 @@ func resolveOrCreateTopics(source *Source, sourceTopicAdminClient, eosAdminClien
 					changeLogPartitionCount, source.config.NumPartitions)
 			}
 		} else {
-			err = createTopic(eosAdminClient, source.NumPartitions(),
+			err = createTopic(sourceTopicAdminClient, source.NumPartitions(),
 				replicationFactorConfig(source), minInSyncConfig(source), CompactCleanupPolicy, 0.5, changLogName)
 			if err != nil {
 				return nil, err
